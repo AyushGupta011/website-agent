@@ -49,26 +49,29 @@ async def validate_and_fix(session_id: str, router: ModelRouter, max_retries: in
             
         print(f"[{session_id}] Validation failed. Requesting fix...")
         
-        # Parse error to find the offending file if possible, or just send the error log
-        # TypeScript errors usually look like: src/components/Hero.tsx(10,5): error ...
-        # Next.js build errors might point to files as well.
+        # Parse error to find the offending files
+        # Look for all .tsx files mentioned
+        file_matches = re.findall(r'([a-zA-Z0-9_/\\]+\.tsx?)', error_output)
         
-        match = re.search(r'([a-zA-Z0-9_/\\]+\.tsx?)\(', error_output)
-        file_to_fix = match.group(1) if match else None
+        # Deduplicate and filter out node_modules
+        unique_files = list(set([f for f in file_matches if "node_modules" not in f]))
         
-        if file_to_fix:
-            file_path = Path(cwd) / file_to_fix
-            if file_path.exists():
-                with open(file_path, "r", encoding="utf-8") as f:
-                    file_content = f.read()
-            else:
-                file_content = "// File not found or couldn't read"
-        else:
-            # If we can't detect the file, maybe it's page.tsx or we just provide the error and ask which file
-            file_to_fix = "src/app/page.tsx" 
-            file_path = Path(cwd) / file_to_fix
-            with open(file_path, "r", encoding="utf-8") as f:
-                file_content = f.read()
+        # Default to page.tsx if nothing found
+        if not unique_files:
+            unique_files = ["src/app/page.tsx"]
+            
+        files_content = ""
+        for f in unique_files:
+            # Clean up the path, sometimes it has absolute path, make it relative to cwd
+            # e.g. C:/.../generated/xyz/src/components/Promo.tsx -> src/components/Promo.tsx
+            rel_path = f
+            if session_id in f:
+                rel_path = f.split(session_id)[-1].strip("\\/")
+            
+            p = Path(cwd) / rel_path
+            if p.exists():
+                with open(p, "r", encoding="utf-8") as file_obj:
+                    files_content += f"\n--- {rel_path} ---\n```tsx\n{file_obj.read()}\n```\n"
 
         prompt = f"""
         The Next.js build or type check failed. 
@@ -76,13 +79,16 @@ async def validate_and_fix(session_id: str, router: ModelRouter, max_retries: in
         Error output:
         {error_output[-2000:]}  # last 2000 chars
         
-        File that might be causing the issue ({file_to_fix}):
-        ```tsx
-        {file_content}
-        ```
+        Files that might be causing the issue:
+        {files_content}
         
-        Please provide the fully corrected contents for this file. 
-        Return ONLY the raw code, no markdown formatting, no explanations.
+        Please provide the fully corrected contents for the file(s) that caused the error.
+        If you need to fix multiple files, wrap EACH file's code in a markdown block prefixed with the filename, like this:
+        
+        ### src/components/Broken.tsx
+        ```tsx
+        export default function Broken() {{ return <div />; }}
+        ```
         """
         
         fixed_code = await router.generate(
@@ -91,18 +97,33 @@ async def validate_and_fix(session_id: str, router: ModelRouter, max_retries: in
             max_provider_attempts=2
         )
         
-        # Clean markdown
-        fixed_code = fixed_code.strip()
-        if fixed_code.startswith("```"):
-            lines = fixed_code.split("\n")
-            if lines[0].startswith("```"): lines = lines[1:]
-            if lines and lines[-1].startswith("```"): lines = lines[:-1]
-            fixed_code = "\n".join(lines).strip()
-            
-        # Write back
-        if file_path.exists():
-            with open(file_path, "w", encoding="utf-8") as f:
-                f.write(fixed_code)
+        # Parse multiple files from LLM response
+        # We look for ### filename followed by ```...```
+        pattern = r"###\s*([^\n]+)\s*```[a-zA-Z]*\n(.*?)```"
+        matches = re.findall(pattern, fixed_code, re.DOTALL)
+        
+        if matches:
+            for filepath, content in matches:
+                filepath = filepath.strip()
+                content = content.strip()
+                p = Path(cwd) / filepath
+                if p.exists():
+                    with open(p, "w", encoding="utf-8") as f:
+                        f.write(content)
+        else:
+            # Fallback if the AI just outputted a single block without ### filename
+            match_code = re.search(r"```[a-zA-Z]*\n(.*?)```", fixed_code, re.DOTALL)
+            if match_code:
+                content = match_code.group(1).strip()
+                # Just write to the first unique file we found
+                if unique_files:
+                    f_to_write = unique_files[0]
+                    if session_id in f_to_write:
+                        f_to_write = f_to_write.split(session_id)[-1].strip("\\/")
+                    p = Path(cwd) / f_to_write
+                    if p.exists():
+                        with open(p, "w", encoding="utf-8") as f:
+                            f.write(content)
                 
     # If we exhaust retries and still fail
     ret_tsc, out_tsc, err_tsc = await run_command("npx tsc --noEmit", cwd)

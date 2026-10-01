@@ -42,9 +42,22 @@ async def start_preview(session_id: str) -> str:
     
     active_previews[session_id] = (process, port)
     
-    # Wait a moment for server to start
-    await asyncio.sleep(2)
+    # Wait for the server to be fully ready by polling it
+    import urllib.request
     
+    def ping():
+        try:
+            resp = urllib.request.urlopen(f"http://localhost:{port}")
+            return resp.getcode() == 200
+        except Exception:
+            return False
+
+    for _ in range(30):
+        is_ready = await asyncio.to_thread(ping)
+        if is_ready:
+            break
+        await asyncio.sleep(1)
+        
     return f"http://localhost:{port}"
 
 def get_preview_url(session_id: str) -> str | None:
