@@ -58,8 +58,7 @@ db.sqlite3-journal
 ._*
 .Spotlight-V100
 .Trashes
-ehthumbs.db
-Thumbs.db
+
 
 # IDEs and Editors
 .idea/
